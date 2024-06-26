@@ -419,7 +419,7 @@ pub fn MethodBinderT(comptime MethodType: type) type {
                 inline for (0..ArgCount - 1) |i| {
                     if (i < p_argument_count) {
                         Core.variantNewCopy(@ptrCast(&variants[i]), @ptrCast(p_args[i]));
-                    } else if (i < default_args.len){
+                    } else if (i < default_args.len) {
                         variants[i] = default_args[i];
                     }
 
@@ -486,6 +486,100 @@ pub fn MethodBinderT(comptime MethodType: type) type {
     };
 }
 
+pub fn MethodBinderTS(comptime MethodType: type) type {
+    return struct {
+        const ReturnType = @typeInfo(MethodType).Fn.return_type;
+        const ArgCount = @typeInfo(MethodType).Fn.params.len;
+        const ArgsTuple = std.meta.fields(std.meta.ArgsTuple(MethodType));
+        var arg_properties: [ArgCount + 1]Core.C.GDExtensionPropertyInfo = undefined;
+        var arg_metadata: [ArgCount + 1]Core.C.GDExtensionClassMethodArgumentMetadata = undefined;
+        var method_name: StringName = undefined;
+        var method_info: Core.C.GDExtensionClassMethodInfo = undefined;
+        var default_args: []Variant = undefined;
+
+        pub fn bind_call(p_method_userdata: ?*anyopaque, p_instance: Core.C.GDExtensionClassInstancePtr, p_args: [*c]const Core.C.GDExtensionConstVariantPtr, p_argument_count: Core.C.GDExtensionInt, p_return: Core.C.GDExtensionVariantPtr, p_error: [*c]Core.C.GDExtensionCallError) callconv(.C) void {
+            _ = p_instance;
+            _ = p_error;
+            const method: *MethodType = @ptrCast(@alignCast(p_method_userdata));
+            if (ArgCount == 0) {
+                if (ReturnType == void or ReturnType == null) {
+                    @call(.auto, method, .{});
+                } else {
+                    @as(*Variant, @ptrCast(p_return)).* = Variant.initFrom(@call(.auto, method, .{}));
+                }
+            } else {
+                var variants: [ArgCount]Variant = undefined;
+                var args: std.meta.ArgsTuple(MethodType) = undefined;
+                inline for (0..ArgCount) |i| {
+                    if (i < p_argument_count) {
+                        Core.variantNewCopy(@ptrCast(&variants[i]), @ptrCast(p_args[i]));
+                    } else if (i < default_args.len) {
+                        variants[i] = default_args[i];
+                    }
+
+                    args[i] = variants[i].as(ArgsTuple[i].type);
+                }
+                if (ReturnType == void or ReturnType == null) {
+                    @call(.auto, method, args);
+                } else {
+                    @as(*Variant, @ptrCast(p_return)).* = Variant.initFrom(@call(.auto, method, args));
+                }
+            }
+        }
+
+        fn ptrToArg(comptime T: type, p_arg: Core.C.GDExtensionConstTypePtr) T {
+            switch (@typeInfo(T)) {
+                // .Pointer => |pointer| {
+                //     const ObjectType = pointer.child;
+                //     const ObjectTypeName = comptime getBaseName(@typeName(ObjectType));
+                //     const callbacks = @field(ObjectType, "callbacks_" ++ ObjectTypeName);
+                //     if (@hasDecl(ObjectType, "reference") and @hasDecl(ObjectType, "unreference")) { //RefCounted
+                //         const obj = Core.refGetObject(p_arg);
+                //         return @ptrCast(@alignCast(Core.objectGetInstanceBinding(obj, Core.p_library, @ptrCast(&callbacks))));
+                //     } else { //normal Object*
+                //         return @ptrCast(@alignCast(Core.objectGetInstanceBinding(p_arg, Core.p_library, @ptrCast(&callbacks))));
+                //     }
+                // },
+                .Struct => {
+                    if (@hasDecl(T, "reference") and @hasDecl(T, "unreference")) { //RefCounted
+                        const obj = Core.refGetObject(p_arg);
+                        return .{ .godot_object = obj };
+                    } else if (@hasField(T, "godot_object")) {
+                        return .{ .godot_object = p_arg };
+                    } else {
+                        return @as(*T, @ptrCast(@constCast(@alignCast(p_arg)))).*;
+                    }
+                },
+                else => {
+                    return @as(*T, @ptrCast(@constCast(@alignCast(p_arg)))).*;
+                },
+            }
+        }
+
+        pub fn bind_ptrcall(p_method_userdata: ?*anyopaque, p_instance: Core.C.GDExtensionClassInstancePtr, p_args: [*c]const Core.C.GDExtensionConstTypePtr, p_return: Core.C.GDExtensionTypePtr) callconv(.C) void {
+            _ = p_instance;
+            const method: *MethodType = @ptrCast(@alignCast(p_method_userdata));
+            if (ArgCount == 0) {
+                if (ReturnType == void or ReturnType == null) {
+                    @call(.auto, method, .{});
+                } else {
+                    @as(*ReturnType.?, @ptrCast(p_return)).* = @call(.auto, method, .{});
+                }
+            } else {
+                var args: std.meta.ArgsTuple(MethodType) = undefined;
+                inline for (0..ArgCount) |i| {
+                    args[i] = ptrToArg(ArgsTuple[i].type, p_args[i]);
+                }
+                if (ReturnType == void or ReturnType == null) {
+                    @call(.auto, method, args);
+                } else {
+                    @as(*ReturnType.?, @ptrCast(p_return)).* = @call(.auto, method, args);
+                }
+            }
+        }
+    };
+}
+
 var registered_default_arguments: std.StringHashMap([]Variant) = undefined;
 var registered_methods: std.StringHashMap(bool) = undefined;
 pub fn registerMethod(comptime T: type, comptime name: [:0]const u8, args_name: anytype, default_args: anytype) void {
@@ -498,7 +592,10 @@ pub fn registerMethod(comptime T: type, comptime name: [:0]const u8, args_name: 
     registered_methods.put(fullname, true) catch unreachable;
 
     const p_method = @field(T, name);
-    const MethodBinder = MethodBinderT(@TypeOf(p_method));
+    const method_type = @typeInfo(@TypeOf(p_method)).Fn;
+    const is_static = !(method_type.params.len > 0 and method_type.params[0].type == *T);
+    const offset = if (is_static) 0 else 1;
+    const MethodBinder = if (is_static) MethodBinderTS(@TypeOf(p_method)) else MethodBinderT(@TypeOf(p_method));
 
     comptime { // validate between method parameters and default parameters
         const DefaultArgsType = @TypeOf(default_args);
@@ -513,17 +610,17 @@ pub fn registerMethod(comptime T: type, comptime name: [:0]const u8, args_name: 
         }
         const default_args_fields = default_args_type_info.Struct.fields;
         if (args_name.len > 0) {
-            if (args_name.len != MethodBinder.ArgCount - 1) {
+            if (args_name.len != MethodBinder.ArgCount - offset) {
                 @compileError("Cannot have mandatory parameters after optional parameters.");
             }
         }
         if (default_args_fields.len > 0) {
-            if (default_args_fields.len != MethodBinder.ArgCount - 1) {
+            if (default_args_fields.len != MethodBinder.ArgCount - offset) {
                 @compileError("Cannot have mandatory parameters after optional parameters.");
             }
             for (0..default_args_fields.len) |i| {
                 const args_field_type = default_args_fields[i].type;
-                const args_tuple_type: type = MethodBinder.ArgsTuple[i + 1].type;
+                const args_tuple_type: type = MethodBinder.ArgsTuple[i + offset].type;
                 if (args_tuple_type != args_field_type) {
                     @compileError(std.fmt.comptimePrint("Invalid argument for \"{s}()\" function: argument {d} should be \"{any}\" but is \"{any}\".", .{ name, i, args_tuple_type, args_field_type }));
                 }
@@ -555,11 +652,12 @@ pub fn registerMethod(comptime T: type, comptime name: [:0]const u8, args_name: 
     MethodBinder.default_args = defaultArguments[0..];
 
     const has_args_name = args_name.len > 0;
-    inline for (1..MethodBinder.ArgCount) |i| {
+    const bind_offset = offset ^ 1;
+    inline for (1..MethodBinder.ArgCount + bind_offset) |i| {
         MethodBinder.arg_properties[i] = Core.C.GDExtensionPropertyInfo{
-            .type = @intCast(Variant.getVariantType(MethodBinder.ArgsTuple[i].type)),
-            .name = @ptrCast(@constCast(if (has_args_name) &StringName.initFromLatin1Chars(args_name[i-1]) else &StringName.init())),
-            .class_name = getClassName(MethodBinder.ArgsTuple[i].type),
+            .type = @intCast(Variant.getVariantType(MethodBinder.ArgsTuple[i - bind_offset].type)),
+            .name = @ptrCast(@constCast(if (has_args_name) &StringName.initFromLatin1Chars(args_name[i - 1]) else &StringName.init())),
+            .class_name = getClassName(MethodBinder.ArgsTuple[i - bind_offset].type),
             .hint = Core.GlobalEnums.PROPERTY_HINT_NONE,
             .hint_string = @ptrCast(@constCast(&String.init())),
             .usage = Core.GlobalEnums.PROPERTY_USAGE_NONE,
@@ -573,13 +671,13 @@ pub fn registerMethod(comptime T: type, comptime name: [:0]const u8, args_name: 
         .method_userdata = @ptrCast(@constCast(&p_method)),
         .call_func = MethodBinder.bind_call,
         .ptrcall_func = MethodBinder.bind_ptrcall,
-        .method_flags = Core.C.GDEXTENSION_METHOD_FLAG_NORMAL,
+        .method_flags = Core.C.GDEXTENSION_METHOD_FLAG_NORMAL | if (is_static) Core.C.GDEXTENSION_METHOD_FLAG_STATIC else Core.C.GDEXTENSION_METHOD_FLAG_NORMAL,
         .has_return_value = if (MethodBinder.ReturnType != void) 1 else 0,
         .return_value_info = @ptrCast(&MethodBinder.arg_properties[0]),
         .return_value_metadata = MethodBinder.arg_metadata[0],
-        .argument_count = MethodBinder.ArgCount - 1,
-        .arguments_info = @ptrCast(&MethodBinder.arg_properties[1]),
-        .arguments_metadata = @ptrCast(&MethodBinder.arg_metadata[1]),
+        .argument_count = MethodBinder.ArgCount - offset,
+        .arguments_info = if (MethodBinder.arg_properties.len > 1) @ptrCast(&MethodBinder.arg_properties[1]) else null,
+        .arguments_metadata = if (MethodBinder.arg_metadata.len > 1) @ptrCast(&MethodBinder.arg_metadata[1]) else null,
         .default_argument_count = len,
         .default_arguments = if (len > 0) @ptrCast(&defaultArgumentsPtr[0]) else null,
     };
